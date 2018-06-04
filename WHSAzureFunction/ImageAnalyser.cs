@@ -1,94 +1,113 @@
-using System.Linq;
-using System.Net;
-using System.Net.Http;
-using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Host;
-
-
-using System.IO;
-using Microsoft.WindowsAzure.Storage;
-using System.Configuration;
-using Microsoft.Azure;
-using Microsoft.WindowsAzure.Storage.Blob;
 using Microsoft.ProjectOxford.Face;
 using Microsoft.ProjectOxford.Vision;
-
-using System;
-using System.Text;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Blob;
 using Newtonsoft.Json;
+using System;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
+using WHSAzureFunction.Exceptions;
+using WHSAzureFunction.Models;
 
 namespace WHSAzureFunction
 {
     public static class ImageAnalyser
     {
-
-        private static IFaceServiceClient faceServiceClient = new FaceServiceClient("bd8f168ffc814ec7a3d4d7e008455010", "https://australiaeast.api.cognitive.microsoft.com/face/v1.0");
-        private static IVisionServiceClient _visionClient = new VisionServiceClient("7d545178d66d4b189f4e26233268c7e7", "https://australiaeast.api.cognitive.microsoft.com/vision/v1.0");
+        //TODO: take out keys
+        private static IFaceServiceClient faceServiceClient;
+        private static IVisionServiceClient _visionClient;
+        private static NotificationInfo data;
 
         [FunctionName("ImageAnalyser")]
         public static async Task<HttpResponseMessage> Run([HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)]HttpRequestMessage req, TraceWriter log)
         {
-            log.Info("C# HTTP trigger function processed a request.");
-
             // Get request body
             byte[] image = await req.Content.ReadAsByteArrayAsync();
 
+
             if (image != null)
             {
+                faceServiceClient = new FaceServiceClient(GetEnvironmentVariable("FaceApiKey"), GetEnvironmentVariable("FaceApiEndpoint"));
+                _visionClient = new VisionServiceClient(GetEnvironmentVariable("ComputerVisionApiKey"), GetEnvironmentVariable("ComputerVisionApiEndpoint"));
+                data = new NotificationInfo();
+                
                 try
                 {
+                    log.Info("Processing Image...");
                     await ProcessImage(image, log);
                 }
-                catch (ArgumentException e)
+                catch (NoGearException)
                 {
-                    await SendEventsToTopic(new Event(), log);
-                    return req.CreateResponse(HttpStatusCode.OK, "No Safety Gear found!");
+                    //Send no gear event
+                    data.notification = "No Safety Gear Detected";
+                    await SendEventsToTopic(new Event(data, "NoGearEvent"), log);
+                    return GenerateResponse(req);
                 }
-                catch (InvalidOperationException e)
+                catch (UnrecognisedFaceException)
                 {
-                    await SendEventsToTopic(new Event(), log);
-                    return req.CreateResponse(HttpStatusCode.OK, "Unrecognised person!");
+                    data.notification = "Unrecognised Person";
+                    //Send notification that unrecognised person is attempting to enter site
+                    await SendEventsToTopic(new Event(data, "UnrecognisedFaceEvent"), log);
+                    return GenerateResponse(req);
                 }
-                catch (Microsoft.ProjectOxford.Face.FaceAPIException e)
+                catch (FaceAPIException)
                 {
-                    await SendEventsToTopic(new Event(), log);
-                    return req.CreateResponse(HttpStatusCode.OK, "FACE API FAIL");
+                    data.notification = "Unprocessed Image";
+                    return GenerateResponse(req);
                 }
-
+                catch (TooManyFacesException)
+                {
+                    data.notification = "Too many faces";
+                    return GenerateResponse(req);
+                }
+                catch (NoFaceException)
+                {
+                    data.notification = "No Face Detected";
+                    return GenerateResponse(req);
+                }
             }
 
-            return req.CreateResponse(HttpStatusCode.OK, "Hello");
+            return req.CreateResponse(HttpStatusCode.BadRequest, "Image not recognised");
         }
-
 
         public static async Task ProcessImage(byte[] image, TraceWriter log)
         {
-            await Task.WhenAll(SaveToBlob(image, log), IdentifyFace(image, log));
+            //option to save image to blob
+            await Task.WhenAll(//SaveToBlob(image, log),
+                IdentifyFace(image, log));
         }
 
         public static async Task SaveToBlob(byte[] image, TraceWriter log)
         {
-            //string accessKey = ConfigurationManager.AppSettings["StorageAccessKey"];
-            //string accountName = ConfigurationManager.AppSettings["StorageAccountName"];
-            string accessKey = "";
-            string accountName = "";
+            string accessKey = GetEnvironmentVariable("StorageAccessKey");
+            string accountName = GetEnvironmentVariable("StorageAccountName");
             string connectionString = "DefaultEndpointsProtocol=https;AccountName=" + accountName + ";AccountKey=" + accessKey + ";EndpointSuffix=core.windows.net";
-            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(connectionString);
 
+            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(connectionString);
             CloudBlobClient client;
             CloudBlobContainer container;
 
             client = storageAccount.CreateCloudBlobClient();
-            container = client.GetContainerReference("archiveimages");
-            await container.CreateIfNotExistsAsync();
+            container = client.GetContainerReference("unrecognisedface" + DateTime.Now.ToString("ddhmm"));
 
+            if (!await container.ExistsAsync())
+            {
+                await container.CreateIfNotExistsAsync();
+                log.Info("Container created at: " + DateTime.Now.ToString("h-mm-ss tt"));
+            }
+
+            data.image = container.StorageUri.PrimaryUri + "";
             CloudBlockBlob blob;
             string name;
 
-            //change to time string
-            name = Guid.NewGuid().ToString("n") + ".jpg";
+            name = Guid.NewGuid().ToString("n") + ".png";
 
             blob = container.GetBlockBlobReference(name);
 
@@ -96,8 +115,8 @@ namespace WHSAzureFunction
             {
                 await blob.UploadFromStreamAsync(stream);
             }
-            log.Info("BLOB SAVED");
 
+            log.Info("Image saved into Blob Storage");
         }
 
         public static async Task IdentifyFace(byte[] image, TraceWriter log)
@@ -111,31 +130,26 @@ namespace WHSAzureFunction
                     if (faces.Length == 1)
                     {
                         log.Info("ONE FACE FOUND");
-                        //Identify faces + Check Gear 
 
+                        //Identify faces + Check Gear
                         await Task.WhenAll(CheckAuthorized(faces, log), IdentifyGear(image, log));
                     }
                     else if (faces.Length > 1)
                     {
-
                         log.Info("TOO MANY FACES");
-                        //throw new System.InvalidOperationException("Logfile cannot be read-only");    
-                        //break
+                        throw new TooManyFacesException();
                     }
                     else
                     {
                         log.Info("COULD NOT FIND FACE");
-                        //break
+                        throw new NoFaceException();
                     }
                 }
             }
-
             catch (FaceAPIException e)
             {
                 log.Info(e.ToString());
             }
-
-
         }
 
         public static async Task CheckAuthorized(Microsoft.ProjectOxford.Face.Contract.Face[] faces, TraceWriter log)
@@ -147,23 +161,19 @@ namespace WHSAzureFunction
                 if (identifyResult.Candidates.Length == 0)
                 {
                     log.Info("FACE UNRECOGNISED");
-                    throw new System.InvalidOperationException("Logfile cannot be read-only");
-                    //SEND EVENT
-                    //break;
+                    data.notification = "Unrecognised Worker";
+                    throw new UnrecognisedFaceException();
                 }
                 else
                 {
                     // Get top 1 among all candidates returned
                     var candidateId = identifyResult.Candidates[0].PersonId;
                     var person = await faceServiceClient.GetPersonAsync("whsworkers", candidateId);
+                    data.name = person.Name;
                     log.Info("FACE IS " + person.Name);
-
-                    //CHECK AUTHORISED
                 }
             }
-
         }
-
 
         public static async Task IdentifyGear(byte[] image, TraceWriter log)
         {
@@ -175,18 +185,18 @@ namespace WHSAzureFunction
                            tags.Any(t => t.Name == "headdress"))
                 {
                     log.Info("Safety Hat = CHECK");
+                    data.hat = true;
                 }
 
                 if (tags.Any(t => t.Name == "orange") || tags.Any(t => t.Name == "yellow"))
                 {
                     log.Info("Safety Vest = CHECK");
+                    data.vest = true;
                 }
 
-                else
+                if (!data.IsSafe())
                 {
-                    log.Info("SAFETY GEAR UNDETECTED!");
-                    throw new System.ArgumentException("Parameter cannot be null", "original");
-                    //SEND EVENT
+                    throw new NoGearException();
                 }
             }
         }
@@ -200,7 +210,7 @@ namespace WHSAzureFunction
             var httpClient = new HttpClient();
 
             // Add key in the request headers
-            httpClient.DefaultRequestHeaders.Add("aeg-sas-key", "o5R2fcvCqw+Sd1B8Ex8q3/isGY1Pil9hGab+91YTRA8=");
+            httpClient.DefaultRequestHeaders.Add("aeg-sas-key", GetEnvironmentVariable("EventGridKey"));
 
             // Event grid expects event data as JSON
             var json = JsonConvert.SerializeObject(new Event[] { events });
@@ -209,64 +219,25 @@ namespace WHSAzureFunction
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
             // Send request
-            var result = await httpClient.PostAsync("https://unsafenotifications.southeastasia-1.eventgrid.azure.net/api/events", content);
-            log.Info("EVENT GRID LOGGED" + result);
+            var result = await httpClient.PostAsync(GetEnvironmentVariable("EventGridEndpoint"), content);
+            log.Info("Event sent to EventGrid");
         }
-    }
 
-
-    /// <summary>
-    /// Event to be sent to Event Grid Topic.
-    /// </summary>
-    public class Event
-    {
-
-        /// <summary>
-        /// Gets the unique identifier for the event.
-        /// </summary>
-        public string Id { get; }
-
-        /// <summary>
-        /// Gets the publisher defined path to the event subject.
-        /// </summary>
-        public string Subject { get; set; }
-
-        /// <summary>
-        /// Gets the registered event type for this event source.
-        /// </summary>
-        public string EventType { get; }
-
-        /// <summary>
-        /// Gets the time the event is generated based on the provider's UTC time.
-        /// </summary>
-        public string EventTime { get; }
-
-        /// <summary>
-        /// Gets or sets the event data specific to the resource provider.
-        /// </summary>
-        public NotificationInfo Data { get; set; }
-
-        /// <summary>
-        /// Constructor.
-        /// </summary>
-        public Event()
+        private static HttpResponseMessage GenerateResponse(HttpRequestMessage req)
         {
-            Id = Guid.NewGuid().ToString();
-            EventType = "UnsafeNotificationsSubscription";
-            Subject = "UnsafeNotificationsSubscription";
-            NotificationInfo data = new NotificationInfo();
-            data.NotificationType = "Wrong Gear";
-            Data = data;
-            EventTime = DateTime.UtcNow.ToString("o");
+            HttpResponseMessage response = req.CreateResponse(HttpStatusCode.OK, JsonConvert.SerializeObject(data));
+            if (req.Headers.Contains("Origin"))
+            {
+                response.Headers.Add("Access-Control-Allow-Credentials", "true");
+                response.Headers.Add("Access-Control-Allow-Origin", "*");
+                response.Headers.Add("Access-Control-Allow-Methods", "POST, OPTIONS");
+            }
+            return response;
         }
-    }
 
-    public class NotificationInfo
-    {
-        public string NotificationType { get; set; }
+        public static string GetEnvironmentVariable(string name)
+        {
+            return Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.Process);
+        }
     }
 }
-
-
-
-    
